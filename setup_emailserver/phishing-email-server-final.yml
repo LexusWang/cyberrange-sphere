@@ -1,0 +1,291 @@
+---
+- name: Setup Email Server for Phishing Testing (SMTP + IMAP) - Working Version
+  hosts: email_test
+  become: yes
+  vars:
+    test_domain: "test.local"
+    smtp_port: 25
+    imap_port: 143
+    
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install Postfix and Dovecot
+      apt:
+        name:
+          - postfix
+          - dovecot-core
+          - dovecot-imapd
+          - mailutils
+          - netcat-openbsd
+        state: present
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+
+    - name: Configure Postfix for open relay
+      copy:
+        dest: /etc/postfix/main.cf
+        content: |
+          # Postfix configuration for phishing testing
+          smtpd_banner = $myhostname ESMTP
+          biff = no
+          append_dot_mydomain = no
+          
+          # Network settings
+          myhostname = mail.{{ test_domain }}
+          mydomain = {{ test_domain }}
+          myorigin = $mydomain
+          inet_interfaces = all
+          inet_protocols = ipv4
+          
+          # Open relay - TEST ONLY!
+          mydestination = $myhostname, localhost.$mydomain, localhost, $mydomain
+          mynetworks = 0.0.0.0/0
+          relay_domains = 
+          smtpd_relay_restrictions = permit_mynetworks, reject_unauth_destination
+          smtpd_recipient_restrictions = permit_mynetworks, permit
+          
+          # Mailbox settings
+          home_mailbox = Maildir/
+          mailbox_command = 
+          
+          # Disable strict checking
+          smtpd_helo_required = no
+          
+          # Size limits (50MB)
+          message_size_limit = 52428800
+          mailbox_size_limit = 0
+        owner: root
+        group: root
+        mode: '0644'
+      notify: restart postfix
+
+    - name: Configure Dovecot - main config
+      copy:
+        dest: /etc/dovecot/dovecot.conf
+        content: |
+          # Dovecot minimal configuration for testing
+          protocols = imap
+          listen = *
+          ssl = no
+          disable_plaintext_auth = no
+          mail_location = maildir:~/Maildir
+          auth_mechanisms = plain login
+          
+          passdb {
+            driver = passwd-file
+            args = /etc/dovecot/users
+          }
+          
+          userdb {
+            driver = passwd-file
+            args = /etc/dovecot/users
+          }
+          
+          namespace inbox {
+            inbox = yes
+          }
+          
+          service imap-login {
+            inet_listener imap {
+              port = {{ imap_port }}
+            }
+          }
+          
+          service auth {
+            unix_listener auth-userdb {
+              mode = 0666
+            }
+          }
+          
+          log_path = /var/log/dovecot.log
+          info_log_path = /var/log/dovecot-info.log
+          auth_verbose = yes
+          auth_debug = yes
+        owner: root
+        group: root
+        mode: '0644'
+      notify: restart dovecot
+
+    - name: Create test users using adduser command
+      shell: |
+        # Create users if they don't exist
+        if ! id testuser1 &>/dev/null; then
+          useradd -m -s /bin/bash testuser1
+          echo "testuser1:password1" | chpasswd
+        fi
+        
+        if ! id testuser2 &>/dev/null; then
+          useradd -m -s /bin/bash testuser2
+          echo "testuser2:password2" | chpasswd
+        fi
+        
+        if ! id victim &>/dev/null; then
+          useradd -m -s /bin/bash victim
+          echo "victim:victim123" | chpasswd
+        fi
+      args:
+        executable: /bin/bash
+
+    - name: Get user UIDs and GIDs
+      shell: |
+        echo "testuser1:{PLAIN}password1:$(id -u testuser1):$(id -g testuser1)::/home/testuser1"
+        echo "testuser2:{PLAIN}password2:$(id -u testuser2):$(id -g testuser2)::/home/testuser2"
+        echo "victim:{PLAIN}victim123:$(id -u victim):$(id -g victim)::/home/victim"
+      register: dovecot_users_content
+      args:
+        executable: /bin/bash
+
+    - name: Create Dovecot users file with correct UID/GID
+      copy:
+        dest: /etc/dovecot/users
+        content: "{{ dovecot_users_content.stdout }}"
+        owner: dovecot
+        group: dovecot
+        mode: '0640'
+      notify: restart dovecot
+
+    - name: Initialize Maildir for users
+      shell: |
+        for user in testuser1 testuser2 victim; do
+          # Create Maildir structure
+          mkdir -p /home/$user/Maildir/{new,cur,tmp}
+          mkdir -p /home/$user/Maildir/.Sent/{new,cur,tmp}
+          mkdir -p /home/$user/Maildir/.Trash/{new,cur,tmp}
+          mkdir -p /home/$user/Maildir/.Drafts/{new,cur,tmp}
+          
+          # Set correct ownership
+          chown -R $user:$user /home/$user/Maildir
+          chmod -R 700 /home/$user/Maildir
+        done
+      args:
+        executable: /bin/bash
+
+    - name: Ensure services are started
+      systemd:
+        name: "{{ item }}"
+        state: started
+        enabled: yes
+      loop:
+        - postfix
+        - dovecot
+
+    - name: Wait for services to be ready
+      pause:
+        seconds: 3
+
+    - name: Test SMTP service
+      shell: |
+        timeout 2 bash -c "echo 'QUIT' | nc localhost 25" || exit 0
+      register: smtp_test
+      ignore_errors: yes
+
+    - name: Test IMAP login
+      shell: |
+        timeout 3 bash -c "echo 'a1 LOGIN victim victim123' | nc localhost 143" || exit 0
+      register: imap_test
+      ignore_errors: yes
+
+    - name: Display configuration summary
+      debug:
+        msg: |
+          ════════════════════════════════════════════════════════════
+          📧 钓鱼测试邮件服务器配置完成！
+          ════════════════════════════════════════════════════════════
+          
+          ✅ 服务状态:
+             - Postfix (SMTP): {{ 'RUNNING' if smtp_test.rc == 0 else 'CHECK LOGS' }}
+             - Dovecot (IMAP): {{ 'RUNNING' if imap_test.rc == 0 else 'CHECK LOGS' }}
+          
+          🌐 服务器信息:
+             IP地址: {{ ansible_default_ipv4.address }}
+             域名: {{ test_domain }}
+          
+          📤 SMTP服务 (发送邮件):
+             端口: {{ smtp_port }}
+             认证: 不需要
+             加密: 不需要
+             用途: 从A机器发送钓鱼邮件
+          
+          📥 IMAP服务 (接收邮件):
+             端口: {{ imap_port }}
+             认证: 需要用户名密码
+             加密: 不需要
+             用途: 从C机器接收邮件
+          
+          👥 测试用户账户:
+             1. testuser1@{{ test_domain }} / password1
+             2. testuser2@{{ test_domain }} / password2
+             3. victim@{{ test_domain }} / victim123
+          
+          ════════════════════════════════════════════════════════════
+          🎯 快速测试指南
+          ════════════════════════════════════════════════════════════
+          
+          【A机器 - 发送钓鱼邮件】
+          python3 send_email_with_attachment.py \
+            --server {{ ansible_default_ipv4.address }} \
+            --to victim@{{ test_domain }} \
+            --template invoice_attachment \
+            --attachment malware.pdf
+          
+          【C机器 - 接收邮件】
+          python3 receive_emails.py \
+            --server {{ ansible_default_ipv4.address }} \
+            --user victim \
+            --password victim123
+          
+          【B机器 - 查看日志】
+          sudo tail -f /var/log/mail.log        # Postfix日志
+          sudo tail -f /var/log/dovecot.log     # Dovecot日志
+          
+          【B机器 - 直接查看邮件】
+          sudo ls /home/victim/Maildir/new/     # 新邮件
+          sudo cat /home/victim/Maildir/new/*   # 查看邮件内容
+          
+          ════════════════════════════════════════════════════════════
+          🔧 故障排查命令
+          ════════════════════════════════════════════════════════════
+          
+          # 检查服务状态
+          sudo systemctl status postfix
+          sudo systemctl status dovecot
+          
+          # 测试SMTP
+          echo "QUIT" | nc {{ ansible_default_ipv4.address }} 25
+          
+          # 测试IMAP
+          echo "a1 LOGIN victim victim123" | nc {{ ansible_default_ipv4.address }} 143
+          
+          # 重启服务
+          sudo systemctl restart postfix dovecot
+          
+          ════════════════════════════════════════════════════════════
+          ⚠️  重要安全警告
+          ════════════════════════════════════════════════════════════
+          
+          此配置包含以下不安全设置（仅用于测试）：
+          ❌ 无加密传输（明文）
+          ❌ 开放中继（任何人可发送）
+          ❌ 无垃圾邮件过滤
+          ❌ 弱密码
+          
+          ⚠️  仅在隔离的测试网络中使用！
+          ⚠️  不要连接到公网！
+          ⚠️  测试完成后立即关闭！
+          
+          ════════════════════════════════════════════════════════════
+
+  handlers:
+    - name: restart postfix
+      systemd:
+        name: postfix
+        state: restarted
+    
+    - name: restart dovecot
+      systemd:
+        name: dovecot
+        state: restarted

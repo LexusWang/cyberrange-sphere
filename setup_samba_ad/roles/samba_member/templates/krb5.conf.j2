@@ -1,0 +1,18 @@
+[libdefaults]
+    default_realm = {{ domain_name | upper }}
+    dns_lookup_realm = false
+    dns_lookup_kdc = true
+    ticket_lifetime = 24h
+    renew_lifetime = 7d
+    forwardable = true
+
+[realms]
+    {{ domain_name | upper }} = {
+        kdc = victim1.{{ domain_name | lower }}
+        admin_server = victim1.{{ domain_name | lower }}
+        default_domain = {{ domain_name | lower }}
+    }
+
+[domain_realm]
+    .{{ domain_name | lower }} = {{ domain_name | upper }}
+    {{ domain_name | lower }} = {{ domain_name | upper }}

