@@ -32,7 +32,7 @@ In this example, we demonstrate how to deploy a cyber attack range on the SPHERE
     sudo resize2fs /dev/vda3
     ```
 
-    You can also run this [script](../initial_setup/setup-home-disk.md) on the XDC server to solve this issue.
+    You can also run this [script](../initial_setup/resize-root-disk.md) on the XDC server to solve this issue.
 
 
 ### Deploy the Target Victim Machine

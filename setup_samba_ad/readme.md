@@ -5,30 +5,7 @@ In this example, we demonstrate how to deploy a cyber attack range on the SPHERE
 
 ### Deploy the Cyber Range Environment
 
-1. In the "Model Editor" interface of the SPHERE platform, deploy the following model.
-    ```python
-    from mergexp import *
-
-    # Create a network topology object
-    net = Network('AD-Domain', addressing==ipv4, routing==static)
-
-    attacker = net.node('attacker', image=='kali', proc.cores>=8, memory.capacity>=gb(32), disk.capacity==gb(100))
-    victimDC = net.node('victimDC', image=='2404', proc.cores==2, memory.capacity==gb(2), disk.capacity==gb(50))
-    victim1 = net.node('victim1', image=='2404', proc.cores==2, memory.capacity==gb(2), disk.capacity==gb(50))
-    victim2 = net.node('victim2', image=='2404', proc.cores==2, memory.capacity==gb(2), disk.capacity==gb(50))
-    victim3 = net.node('victim3', image=='2404', proc.cores==2, memory.capacity==gb(2), disk.capacity==gb(50))
-    victim4 = net.node('victim4', image=='2404', proc.cores==2, memory.capacity==gb(2), disk.capacity==gb(50))
-    victim5 = net.node('victim5', image=='2404', proc.cores==2, memory.capacity==gb(2), disk.capacity==gb(50))
-
-    # Attacker connects to victim1; all victim machines share a separate internal network
-    link = net.connect([attacker, victim1])
-    link = net.connect([victimDC, victim1, victim2, victim3, victim4, victim5])
-
-    # Make this file a runnable experiment
-    experiment(net)
-    ```
-
-    The topology above can also be found at [`mergexp/ad.py`](../mergexp/ad.py).
+1. In the "Model Editor" interface of the SPHERE platform, deploy the this model [`mergexp/ad.py`](../mergexp/ad.py).
 
 2. Create a Reservation based on that model.
 
@@ -40,7 +17,7 @@ In this example, we demonstrate how to deploy a cyber attack range on the SPHERE
     sudo resize2fs /dev/vda3
     ```
 
-    You can also run this [script](../initial_setup/setup-home-disk.md) on the XDC server to solve this issue.
+    You can also run this [script](../initial_setup/resize-root-disk.md) on the XDC server to solve this issue.
 
 
 ### Deploy the Target Victim Machines
