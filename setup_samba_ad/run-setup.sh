@@ -94,27 +94,27 @@ TARGET="${1:-all}"
 case "$TARGET" in
     dc)
         echo -e "${YELLOW}Configuring domain controller (${DC_HOST})...${NC}"
-        ansible-playbook site.yml --tags dc --ask-become-pass
+        ansible-playbook site.yml --tags dc
         ;;
     members)
         echo -e "${YELLOW}Configuring ${MEMBER_COUNT} domain member(s): ${MEMBERS_INLINE}...${NC}"
-        ansible-playbook site.yml --tags members --ask-become-pass
+        ansible-playbook site.yml --tags members
         ;;
     all)
         echo -e "${YELLOW}Configuring full AD environment...${NC}"
         echo ""
         echo "Step 1: Configure domain controller (${DC_HOST})"
-        ansible-playbook site.yml --tags dc --ask-become-pass
+        ansible-playbook site.yml --tags dc
         echo ""
         echo -e "${GREEN}Domain controller configured. Waiting 10 seconds before configuring domain members...${NC}"
         sleep 10
         echo ""
         echo "Step 2: Configure ${MEMBER_COUNT} domain member(s): ${MEMBERS_INLINE}"
-        ansible-playbook site.yml --tags members --ask-become-pass
+        ansible-playbook site.yml --tags members
         ;;
     check)
         echo -e "${YELLOW}Checking connectivity to all hosts...${NC}"
-        ansible all -m ping --ask-become-pass
+        ansible all -m ping
         ;;
     *)
         echo "Usage: $0 [dc|members|all|check]"
