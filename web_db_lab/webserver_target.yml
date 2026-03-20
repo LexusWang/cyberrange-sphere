@@ -1,0 +1,237 @@
+---
+- name: Deploy Web Server with Vulnerable App (Web-DB Lateral Movement Lab)
+  hosts: webserver
+  become: yes
+
+  vars:
+    wp_path: /var/www/html
+    wp_url: "http://10.0.0.2"
+    wp_admin_user: wpadmin
+    wp_admin_pass: "WpAdmin@2024"
+    wp_admin_email: "admin@company.local"
+    db_host: "10.0.1.2"
+    db_name: wordpress
+    db_user: wp_user
+    db_pass: "WpDb@2024Secure"
+
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install Apache, PHP and required extensions
+      apt:
+        name:
+          - apache2
+          - php
+          - libapache2-mod-php
+          - php-mysql
+          - php-curl
+          - php-gd
+          - php-xml
+          - php-mbstring
+          - php-zip
+          - php-intl
+          - unzip
+          - curl
+          - mysql-client
+        state: present
+
+    - name: Enable Apache mod_rewrite
+      shell: a2enmod rewrite
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Download WP-CLI
+      get_url:
+        url: https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
+        dest: /usr/local/bin/wp
+        mode: '0755'
+        timeout: 60
+
+    - name: Remove default Apache index page
+      file:
+        path: "{{ wp_path }}/index.html"
+        state: absent
+
+    - name: Download WordPress
+      shell: >-
+        wp core download --path={{ wp_path }} --allow-root
+      args:
+        creates: "{{ wp_path }}/wp-login.php"
+        executable: /bin/bash
+
+    - name: Create WordPress config
+      shell: >-
+        wp config create
+        --path={{ wp_path }}
+        --dbname={{ db_name }}
+        --dbuser={{ db_user }}
+        --dbpass='{{ db_pass }}'
+        --dbhost={{ db_host }}
+        --allow-root
+        --force
+      args:
+        executable: /bin/bash
+
+    - name: Wait for MySQL to be reachable from webserver
+      wait_for:
+        host: "{{ db_host }}"
+        port: 3306
+        delay: 2
+        timeout: 30
+
+    - name: Install WordPress
+      shell: >-
+        wp core install
+        --path={{ wp_path }}
+        --url='{{ wp_url }}'
+        --title='Company Internal Portal'
+        --admin_user={{ wp_admin_user }}
+        --admin_password='{{ wp_admin_pass }}'
+        --admin_email={{ wp_admin_email }}
+        --skip-email
+        --allow-root
+      args:
+        executable: /bin/bash
+      register: wp_install
+      changed_when: "'already installed' not in wp_install.stdout"
+
+    - name: Deploy vulnerable network monitoring tool
+      copy:
+        dest: "{{ wp_path }}/monitor.php"
+        content: |
+          <?php
+          /**
+           * Company Internal Network Monitor v2.1
+           * For authorized IT staff use only.
+           */
+          $output = '';
+          $host = '';
+          if (isset($_GET['host']) && !empty($_GET['host'])) {
+              $host = $_GET['host'];
+              $output = shell_exec("ping -c 3 " . $host . " 2>&1");
+          }
+          if (isset($_GET['tool']) && $_GET['tool'] === 'traceroute' && !empty($_GET['host'])) {
+              $output = shell_exec("traceroute " . $host . " 2>&1");
+          }
+          ?>
+          <!DOCTYPE html>
+          <html>
+          <head>
+              <title>Network Monitor - IT Operations</title>
+              <style>
+                  body { font-family: Arial, sans-serif; margin: 40px; background: #f5f5f5; }
+                  .container { max-width: 800px; margin: 0 auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+                  h1 { color: #333; border-bottom: 2px solid #0066cc; padding-bottom: 10px; }
+                  .warning { background: #fff3cd; border: 1px solid #ffc107; padding: 10px; border-radius: 4px; margin: 10px 0; font-size: 0.9em; }
+                  form { margin: 20px 0; }
+                  input[type="text"] { padding: 8px 12px; width: 300px; border: 1px solid #ccc; border-radius: 4px; }
+                  button { padding: 8px 20px; background: #0066cc; color: white; border: none; border-radius: 4px; cursor: pointer; margin-left: 5px; }
+                  button:hover { background: #0052a3; }
+                  pre { background: #1e1e1e; color: #d4d4d4; padding: 15px; border-radius: 4px; overflow-x: auto; white-space: pre-wrap; }
+                  .nav { margin-bottom: 20px; }
+                  .nav a { margin-right: 15px; color: #0066cc; text-decoration: none; }
+              </style>
+          </head>
+          <body>
+              <div class="container">
+                  <div class="nav">
+                      <a href="/">&#8592; Back to Portal</a>
+                      <a href="/monitor.php">Network Monitor</a>
+                  </div>
+                  <h1>&#128274; Internal Network Monitor</h1>
+                  <div class="warning">
+                      &#9888; This tool is for authorized IT operations staff only. All actions are logged.
+                  </div>
+                  <form method="get">
+                      <label>Target Host:</label><br><br>
+                      <input type="text" name="host" value="<?php echo htmlspecialchars($host); ?>" placeholder="e.g. 10.0.1.2 or company.local">
+                      <button type="submit">Ping</button>
+                      <button type="submit" name="tool" value="traceroute">Traceroute</button>
+                  </form>
+                  <?php if ($output): ?>
+                  <h3>Result:</h3>
+                  <pre><?php echo htmlspecialchars($output); ?></pre>
+                  <?php endif; ?>
+              </div>
+          </body>
+          </html>
+        owner: www-data
+        group: www-data
+        mode: '0644'
+
+    - name: Set proper ownership for WordPress files
+      file:
+        path: "{{ wp_path }}"
+        owner: www-data
+        group: www-data
+        recurse: yes
+
+    - name: Configure Apache to allow .htaccess overrides
+      copy:
+        dest: /etc/apache2/sites-available/000-default.conf
+        content: |
+          <VirtualHost *:80>
+              DocumentRoot {{ wp_path }}
+              <Directory {{ wp_path }}>
+                  AllowOverride All
+                  Require all granted
+              </Directory>
+              ErrorLog ${APACHE_LOG_DIR}/error.log
+              CustomLog ${APACHE_LOG_DIR}/access.log combined
+          </VirtualHost>
+        mode: '0644'
+
+    - name: Restart Apache
+      systemd:
+        name: apache2
+        state: restarted
+        enabled: yes
+
+    - name: Disable IP forwarding (prevent attacker from routing to internal network)
+      sysctl:
+        name: net.ipv4.ip_forward
+        value: '0'
+        sysctl_file: /etc/sysctl.d/99-no-forward.conf
+        reload: yes
+
+    - name: Disable firewall
+      shell: ufw disable || true
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Verify WordPress is accessible
+      uri:
+        url: "{{ wp_url }}/"
+        status_code: 200
+        timeout: 10
+      register: wp_check
+      retries: 3
+      delay: 5
+      until: wp_check.status == 200
+
+    - name: Display completion message
+      debug:
+        msg:
+          - "================================================="
+          - "Web server deployed successfully!"
+          - "================================================="
+          - "WordPress URL: {{ wp_url }}/"
+          - "WP Admin:      {{ wp_url }}/wp-admin/"
+          - "  User: {{ wp_admin_user }}"
+          - "  Pass: {{ wp_admin_pass }}"
+          - ""
+          - "Vulnerable tool: {{ wp_url }}/monitor.php"
+          - "  Command injection in 'host' parameter"
+          - ""
+          - "DB credentials in wp-config.php:"
+          - "  Host: {{ db_host }}"
+          - "  User: {{ db_user }}"
+          - "  Pass: {{ db_pass }}"
+          - ""
+          - "IP forwarding: disabled"
+          - "================================================="

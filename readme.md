@@ -38,8 +38,9 @@ Here, we present a complete [example](struts2_lab/readme.md) demonstrating how t
 ## Multi-Machine Scenarios
 Multi-Machine scenarios refer to attack simulation environments that involve more than two machines. Typically, there are multiple victim machines, which can be used to simulate attack scenarios that require lateral movement.
 
-Here, we also use an [example](setup_samba_ad/readme.md) to demonstrate how to deploy the environments using SPHERE.
+### Deployed Scenarios
 
-### AD Domain
-
-Please refer to this [doc](setup_samba_ad/ANSIBLE_DEPLOYMENT.md) to setup Samba4 Active Directory Lab Environment based on multiple machines.
+| Lab | Machines | Attack Type | Link |
+|-----|----------|-------------|------|
+| Web + DB Lateral Movement | 3 (attacker + webserver + dbserver) | Command injection → credential discovery → lateral movement via SSH | [deploy](web_db_lab/readme.md) |
+| Samba4 AD Domain | 7 (attacker + DC + 5 victims) | AD enumeration → lateral movement → domain compromise | [deploy](setup_samba_ad/readme.md) |

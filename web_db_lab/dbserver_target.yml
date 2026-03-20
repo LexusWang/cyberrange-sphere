@@ -1,0 +1,161 @@
+---
+- name: Deploy Internal Database Server (Web-DB Lateral Movement Lab)
+  hosts: dbserver
+  become: yes
+
+  vars:
+    mysql_wp_user: wp_user
+    mysql_wp_pass: "WpDb@2024Secure"
+    mysql_wp_db: wordpress
+    company_db: company
+    dbadmin_user: dbadmin
+    dbadmin_pass: "S3cur3Passw0rd!"
+    webserver_ip: "10.0.1.1"
+
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install MySQL server
+      apt:
+        name:
+          - mysql-server
+          - iptables-persistent
+        state: present
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+
+    - name: Start and enable MySQL
+      systemd:
+        name: mysql
+        state: started
+        enabled: yes
+
+    - name: Configure MySQL to listen on all interfaces
+      shell: |
+        sed -i 's/^bind-address.*/bind-address = 0.0.0.0/' /etc/mysql/mysql.conf.d/mysqld.cnf
+      args:
+        executable: /bin/bash
+      register: mysql_bind
+      changed_when: mysql_bind.rc == 0
+
+    - name: Restart MySQL
+      systemd:
+        name: mysql
+        state: restarted
+
+    - name: Create databases and MySQL user
+      shell: |
+        mysql <<'EOSQL'
+        CREATE DATABASE IF NOT EXISTS {{ mysql_wp_db }};
+        CREATE DATABASE IF NOT EXISTS {{ company_db }};
+        CREATE USER IF NOT EXISTS '{{ mysql_wp_user }}'@'10.0.1.%' IDENTIFIED BY '{{ mysql_wp_pass }}';
+        GRANT ALL PRIVILEGES ON {{ mysql_wp_db }}.* TO '{{ mysql_wp_user }}'@'10.0.1.%';
+        GRANT SELECT ON {{ company_db }}.* TO '{{ mysql_wp_user }}'@'10.0.1.%';
+        FLUSH PRIVILEGES;
+        EOSQL
+      args:
+        executable: /bin/bash
+
+    - name: Create company users table with sensitive data
+      shell: |
+        mysql {{ company_db }} <<'EOSQL'
+        CREATE TABLE IF NOT EXISTS users (
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          username VARCHAR(50) NOT NULL,
+          password VARCHAR(100) NOT NULL,
+          email VARCHAR(100),
+          role VARCHAR(50),
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        DELETE FROM users;
+        INSERT INTO users (username, password, email, role) VALUES
+          ('admin',    'Admin@Company2024',  'admin@company.local',   'administrator'),
+          ('dbadmin',  'S3cur3Passw0rd!',    'dbadmin@company.local', 'dba'),
+          ('jsmith',   'Welcome123',         'jsmith@company.local',  'developer'),
+          ('mwilson',  'Mwilson2024',        'mwilson@company.local', 'analyst');
+        EOSQL
+      args:
+        executable: /bin/bash
+
+    - name: Create dbadmin Linux user (password reuse target)
+      user:
+        name: "{{ dbadmin_user }}"
+        password: "{{ dbadmin_pass | password_hash('sha512') }}"
+        shell: /bin/bash
+        create_home: yes
+
+    - name: Create sensitive flag file on dbadmin home
+      copy:
+        dest: /home/{{ dbadmin_user }}/confidential_data.txt
+        content: |
+          =============================================
+          CONFIDENTIAL - Internal Database Server
+          =============================================
+
+          Database Backup Credentials:
+            Host: db-backup.company.local
+            User: backup_admin
+            Pass: Backup#Str0ng2024
+
+          API Keys:
+            Production: ak_prod_8f3j2k5m9p1q4r7t
+            Staging: ak_stag_2b5n8q1t4w7z0c3f
+
+          This file confirms you have reached the
+          internal database server via lateral movement.
+          =============================================
+        owner: "{{ dbadmin_user }}"
+        group: "{{ dbadmin_user }}"
+        mode: '0600'
+
+    - name: Enable SSH password authentication
+      shell: |
+        sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+        sed -i 's/^KbdInteractiveAuthentication no/KbdInteractiveAuthentication yes/' /etc/ssh/sshd_config
+      args:
+        executable: /bin/bash
+
+    - name: Restart SSH
+      systemd:
+        name: ssh
+        state: restarted
+
+    - name: Configure iptables - restrict MySQL access to webserver only
+      shell: |
+        iptables -F INPUT
+        iptables -A INPUT -i lo -j ACCEPT
+        iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+        # SSH open to all (needed for infra/Ansible management)
+        iptables -A INPUT -p tcp --dport 22 -j ACCEPT
+        # MySQL only from webserver
+        iptables -A INPUT -s {{ webserver_ip }} -p tcp --dport 3306 -j ACCEPT
+        # ICMP from webserver
+        iptables -A INPUT -s {{ webserver_ip }} -p icmp -j ACCEPT
+        # Drop everything else from experiment networks
+        iptables -A INPUT -s 10.0.0.0/16 -j DROP
+        # Save rules
+        iptables-save > /etc/iptables/rules.v4
+      args:
+        executable: /bin/bash
+
+    - name: Disable ufw to avoid conflicts with iptables
+      shell: ufw disable || true
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Display completion message
+      debug:
+        msg:
+          - "================================================="
+          - "Database server deployed successfully!"
+          - "================================================="
+          - "MySQL listening on 0.0.0.0:3306"
+          - "WordPress DB: {{ mysql_wp_db }} (user: {{ mysql_wp_user }})"
+          - "Company DB:   {{ company_db }} (contains users table)"
+          - "Firewall:     MySQL only from {{ webserver_ip }}"
+          - "Lateral movement target: {{ dbadmin_user }}"
+          - "================================================="
