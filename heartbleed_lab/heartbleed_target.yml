@@ -1,0 +1,448 @@
+---
+- name: Deploy Heartbleed (CVE-2014-0160) Lab
+  hosts: heartbleed_vm
+  become: yes
+
+  vars:
+    openssl_version: "1.0.1f"
+    nginx_version: "1.6.3"
+    openssl_src: "/opt/openssl-{{ openssl_version }}"
+    openssl_install: "/opt/openssl-{{ openssl_version }}-install"
+    nginx_src: "/opt/nginx-{{ nginx_version }}"
+    nginx_install: "/opt/nginx-heartbleed"
+    ssl_cert_dir: /etc/heartbleed-lab/ssl
+
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install build dependencies
+      apt:
+        name:
+          - build-essential
+          - libpcre3
+          - libpcre3-dev
+          - zlib1g
+          - zlib1g-dev
+          - perl
+          - make
+        state: present
+
+    - name: Download OpenSSL {{ openssl_version }} source (vulnerable to Heartbleed)
+      get_url:
+        url: "https://www.openssl.org/source/old/1.0.1/openssl-{{ openssl_version }}.tar.gz"
+        dest: "/tmp/openssl-{{ openssl_version }}.tar.gz"
+        timeout: 60
+
+    - name: Extract OpenSSL source
+      unarchive:
+        src: "/tmp/openssl-{{ openssl_version }}.tar.gz"
+        dest: /opt/
+        remote_src: yes
+        creates: "{{ openssl_src }}/config"
+
+    - name: Download nginx {{ nginx_version }} source
+      get_url:
+        url: "http://nginx.org/download/nginx-{{ nginx_version }}.tar.gz"
+        dest: "/tmp/nginx-{{ nginx_version }}.tar.gz"
+        timeout: 60
+
+    - name: Extract nginx source
+      unarchive:
+        src: "/tmp/nginx-{{ nginx_version }}.tar.gz"
+        dest: /opt/
+        remote_src: yes
+        creates: "{{ nginx_src }}/configure"
+
+    - name: Clean previous partial nginx build (ensures fresh configure)
+      shell: |
+        if [ -f {{ nginx_src }}/Makefile ] && [ ! -f {{ nginx_install }}/sbin/nginx ]; then
+          make -C {{ nginx_src }} clean 2>/dev/null || true
+        fi
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Build OpenSSL 1.0.1f static libraries (suppress GCC 13 warnings)
+      shell: |
+        cd {{ openssl_src }}
+        ./config no-asm --prefix={{ openssl_install }} --openssldir={{ openssl_install }}
+        sed -i '/^CFLAG=/ s/$/ -std=gnu89 -w/' Makefile
+        if ! make > /tmp/openssl_build.log 2>&1; then
+          echo "=== ERROR lines ==="
+          grep -E "error:" /tmp/openssl_build.log | grep -v "echo Never mind" | head -30
+          echo "=== Last 15 lines ==="
+          tail -15 /tmp/openssl_build.log
+          exit 1
+        fi
+        make install_sw >> /tmp/openssl_build.log 2>&1 || { tail -20 /tmp/openssl_build.log; exit 1; }
+      args:
+        creates: "{{ openssl_install }}/lib/libssl.a"
+        executable: /bin/bash
+      timeout: 900
+
+    - name: Backup original OpenSSL config script
+      shell: cp {{ openssl_src }}/config {{ openssl_src }}/config.orig
+      args:
+        creates: "{{ openssl_src }}/config.orig"
+
+    - name: Install GCC 13 compatibility wrapper for OpenSSL config
+      copy:
+        dest: "{{ openssl_src }}/config"
+        mode: "0755"
+        content: |
+          #!/bin/bash
+          DIR=$(dirname $(readlink -f $0))
+          $DIR/config.orig "$@"
+          RC=$?
+          if [ -f $DIR/Makefile ]; then
+            sed -i '/^CFLAG=/ s/$/ -std=gnu89 -w/' $DIR/Makefile
+            touch $DIR/Makefile
+          fi
+          exit $RC
+
+    - name: Prepare .openssl directory for nginx configure detection test
+      shell: >-
+        mkdir -p {{ openssl_src }}/.openssl/include &&
+        mkdir -p {{ openssl_src }}/.openssl/lib &&
+        cp -r {{ openssl_install }}/include/openssl {{ openssl_src }}/.openssl/include/ &&
+        cp {{ openssl_install }}/lib/libssl.a {{ openssl_src }}/.openssl/lib/ &&
+        cp {{ openssl_install }}/lib/libcrypto.a {{ openssl_src }}/.openssl/lib/ &&
+        touch {{ openssl_src }}/.openssl/include/openssl/ssl.h
+      args:
+        executable: /bin/bash
+
+    - name: Configure nginx with OpenSSL 1.0.1f
+      shell: >-
+        cd {{ nginx_src }} &&
+        ./configure
+        --prefix={{ nginx_install }}
+        --with-http_ssl_module
+        --with-openssl={{ openssl_src }}
+      args:
+        creates: "{{ nginx_src }}/objs/Makefile"
+        executable: /bin/bash
+
+    - name: Patch nginx source for glibc 2.28+ (remove current_salt reference)
+      shell: >-
+        sed -i '/cd\.current_salt\[0\]/d' {{ nginx_src }}/src/os/unix/ngx_user.c
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Patch nginx objs/Makefile for GCC 13 compat and OpenSSL install_sw
+      shell: |
+        sed -i 's|) install LIBDIR=lib|) install_sw LIBDIR=lib|g' {{ nginx_src }}/objs/Makefile
+        sed -i 's|-Werror|-Wno-error|g' {{ nginx_src }}/objs/Makefile
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Touch OpenSSL Makefile to prevent stale timestamp check in nginx build
+      shell: "[ -f {{ openssl_src }}/Makefile ] && touch {{ openssl_src }}/Makefile || true"
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Refresh .openssl directory so ssl.h is newer than objs/Makefile
+      shell: >-
+        mkdir -p {{ openssl_src }}/.openssl/include/openssl &&
+        mkdir -p {{ openssl_src }}/.openssl/lib &&
+        cp -r {{ openssl_install }}/include/openssl/* {{ openssl_src }}/.openssl/include/openssl/ &&
+        cp {{ openssl_install }}/lib/libssl.a {{ openssl_src }}/.openssl/lib/ &&
+        cp {{ openssl_install }}/lib/libcrypto.a {{ openssl_src }}/.openssl/lib/ &&
+        touch {{ openssl_src }}/.openssl/include/openssl/ssl.h
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Build and install nginx with OpenSSL 1.0.1f
+      shell: >-
+        cd {{ nginx_src }} &&
+        find objs -name '*.o' -delete 2>/dev/null;
+        cd {{ nginx_src }} &&
+        make -j$(nproc) > /tmp/nginx_build.log 2>&1 &&
+        make install >> /tmp/nginx_build.log 2>&1 ||
+        { tail -50 /tmp/nginx_build.log; exit 1; }
+      args:
+        creates: "{{ nginx_install }}/sbin/nginx"
+        executable: /bin/bash
+      timeout: 600
+
+    - name: Create SSL certificate directory
+      file:
+        path: "{{ ssl_cert_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Generate self-signed TLS certificate
+      command: >
+        openssl req -x509 -nodes -days 3650
+        -newkey rsa:2048
+        -keyout {{ ssl_cert_dir }}/server.key
+        -out {{ ssl_cert_dir }}/server.crt
+        -subj "/CN=internal.company.lab/O=Company Internal/C=US"
+      args:
+        creates: "{{ ssl_cert_dir }}/server.crt"
+
+    - name: Create web content with simulated sensitive data
+      copy:
+        dest: "{{ nginx_install }}/html/index.html"
+        content: |
+          <html>
+          <head><title>Company Secure Portal</title></head>
+          <body>
+          <h1>Internal Secure Portal</h1>
+          <p>This portal uses TLS encryption to protect your credentials.</p>
+          <form method="post" action="/login">
+            Username: <input type="text" name="username"><br>
+            Password: <input type="password" name="password"><br>
+            <input type="submit" value="Login">
+          </form>
+          </body>
+          </html>
+        mode: '0644'
+
+    - name: Configure nginx with HTTPS using vulnerable OpenSSL
+      copy:
+        dest: "{{ nginx_install }}/conf/nginx.conf"
+        content: |
+          worker_processes 2;
+          pid {{ nginx_install }}/logs/nginx.pid;
+
+          events {
+              worker_connections 1024;
+          }
+
+          http {
+              include      mime.types;
+              default_type application/octet-stream;
+              sendfile     on;
+
+              # HTTPS server with vulnerable OpenSSL 1.0.1f
+              # Heartbeat extension is enabled by default in this version
+              server {
+                  listen 443 ssl;
+                  server_name _;
+
+                  ssl_certificate     {{ ssl_cert_dir }}/server.crt;
+                  ssl_certificate_key {{ ssl_cert_dir }}/server.key;
+                  ssl_protocols       TLSv1 TLSv1.1 TLSv1.2;
+                  ssl_ciphers         HIGH:!aNULL:!MD5;
+
+                  root  {{ nginx_install }}/html;
+                  index index.html;
+
+                  location / {
+                      try_files $uri $uri/ =404;
+                  }
+              }
+
+              # HTTP redirect to HTTPS
+              server {
+                  listen 80;
+                  server_name _;
+                  return 301 https://$host$request_uri;
+              }
+          }
+        mode: '0644'
+
+    - name: Create nginx-heartbleed systemd service
+      copy:
+        dest: /etc/systemd/system/nginx-heartbleed.service
+        content: |
+          [Unit]
+          Description=Nginx with Vulnerable OpenSSL 1.0.1f (Heartbleed Lab)
+          After=network.target
+
+          [Service]
+          Type=forking
+          PIDFile={{ nginx_install }}/logs/nginx.pid
+          ExecStartPre={{ nginx_install }}/sbin/nginx -t
+          ExecStart={{ nginx_install }}/sbin/nginx
+          ExecReload=/bin/kill -s HUP $MAINPID
+          ExecStop=/bin/kill -s QUIT $MAINPID
+          TimeoutStartSec=60
+          Restart=on-failure
+
+          [Install]
+          WantedBy=multi-user.target
+        mode: '0644'
+
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: yes
+
+    - name: Enable and start nginx-heartbleed service
+      systemd:
+        name: nginx-heartbleed
+        state: started
+        enabled: yes
+
+    - name: Wait for HTTPS to be available
+      wait_for:
+        port: 443
+        delay: 3
+        timeout: 30
+
+    - name: Create test user account
+      shell: |
+        if ! id webuser >/dev/null 2>&1; then
+          useradd -m -s /bin/bash webuser
+        fi
+        echo 'webuser:password123' | chpasswd
+      args:
+        executable: /bin/bash
+
+    - name: Disable firewall
+      ufw:
+        state: disabled
+
+    - name: Get target IP address
+      set_fact:
+        target_ip: "{{ ansible_default_ipv4.address }}"
+
+    - name: Create info file
+      copy:
+        dest: /root/TARGET_INFO.txt
+        content: |
+          ===================================================
+          HEARTBLEED (CVE-2014-0160) LAB
+          ===================================================
+
+          Service: nginx {{ nginx_version }} compiled with OpenSSL {{ openssl_version }}
+          Vulnerability: Heartbleed - TLS Heartbeat buffer over-read
+          CVE: CVE-2014-0160
+          CVSS Score: 7.5 (High) - actual impact often considered Critical
+          OpenSSL Version: {{ openssl_version }} (vulnerable; patch was 1.0.1g)
+          Port: 443 (HTTPS)
+
+          HTTPS URL: https://{{ target_ip }}/
+
+          ===================================================
+          VULNERABILITY OVERVIEW
+          ===================================================
+
+          OpenSSL 1.0.1 through 1.0.1f implement the TLS Heartbeat extension.
+          A malformed heartbeat request can ask the server to return up to
+          64KB of its own process memory, which may contain:
+            - Private TLS session keys
+            - Username/password pairs from recent HTTPS requests
+            - JWT tokens, cookies, and other secrets
+            - Memory contents of other concurrent connections
+
+          The attack is passive (no authentication required, no logs by default).
+
+          ===================================================
+          DETECTION
+          ===================================================
+
+          # Nmap heartbleed detection script
+          nmap -sV --script ssl-heartbleed -p 443 {{ target_ip }}
+
+          # Check TLS certificate details
+          openssl s_client -connect {{ target_ip }}:443 2>/dev/null | head -20
+
+          # sslscan
+          sslscan {{ target_ip }}:443
+
+          ===================================================
+          EXPLOITATION
+          ===================================================
+
+          # Method 1: Python PoC script (heartbleed.py)
+          # Dump 64KB chunks of server memory
+          python3 heartbleed.py {{ target_ip }}
+
+          # heartbleed.py is available at:
+          # https://gist.github.com/takeshixx/10107280
+
+          # Method 2: Metasploit
+          use auxiliary/scanner/ssl/openssl_heartbleed
+          set RHOSTS {{ target_ip }}
+          set RPORT 443
+          set VERBOSE true
+          run
+
+          # Method 3: sslyze
+          sslyze --heartbleed {{ target_ip }}:443
+
+          ===================================================
+          MEMORY LEAK ANALYSIS
+          ===================================================
+
+          After running the exploit, look for these patterns in the output:
+            - "Authorization: Basic ..." (base64-encoded credentials)
+            - "Cookie: session=" (session tokens)
+            - Certificate private key material (PEM headers)
+            - HTTP request/response fragments
+
+          # Trigger HTTPS login attempt first (to plant credentials in memory)
+          curl -k -X POST https://{{ target_ip }}/login \
+            -d "username=admin&password=SecretPassword123"
+
+          # Then immediately run heartbleed to capture the leaked memory
+          python3 heartbleed.py {{ target_ip }}
+
+          ===================================================
+          SERVICE MANAGEMENT
+          ===================================================
+
+          systemctl status nginx-heartbleed
+          {{ nginx_install }}/sbin/nginx -t  (config test)
+          {{ nginx_install }}/sbin/nginx -v  (show OpenSSL version)
+
+          ===================================================
+          CREDENTIALS
+          ===================================================
+
+          SSH User: webuser
+          Password: password123
+
+          ===================================================
+          ATTACK CHAIN EXAMPLE
+          ===================================================
+
+          1. Recon:      Nmap reveals HTTPS on port 443
+          2. Detection:  ssl-heartbleed NSE script confirms vulnerability
+          3. Trigger:    Make a login POST request (plant creds in memory)
+          4. Exploit:    Run heartbleed PoC to dump server memory
+          5. Extract:    Parse output for credentials and keys
+          6. Access:     Use harvested credentials or keys for further access
+
+          ===================================================
+        mode: '0644'
+
+    - name: Verify nginx is serving HTTPS
+      uri:
+        url: "https://{{ target_ip }}/"
+        validate_certs: no
+        status_code: 200
+        timeout: 10
+      register: https_check
+      retries: 3
+      delay: 5
+      until: https_check.status == 200
+
+    - name: Display completion message
+      debug:
+        msg:
+          - "========================================================="
+          - "Heartbleed Lab deployed successfully!"
+          - "========================================================="
+          - "Target URL:     https://{{ target_ip }}/"
+          - "OpenSSL:        {{ openssl_version }} (CVE-2014-0160)"
+          - "nginx binary:   {{ nginx_install }}/sbin/nginx"
+          - ""
+          - "Quick verify:"
+          - "  nmap -sV --script ssl-heartbleed -p 443 {{ target_ip }}"
+          - ""
+          - "SSH access:"
+          - "  ssh webuser@{{ target_ip }}"
+          - "  Password: password123"
+          - ""
+          - "Service management:"
+          - "  sudo systemctl status nginx-heartbleed"
+          - "========================================================="

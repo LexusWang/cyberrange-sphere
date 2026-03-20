@@ -11,33 +11,29 @@ Together with the attacker’s environment (which also usually consists of a sin
 
 Here, we present a complete [example](struts2_lab/readme.md) demonstrating how to deploy the environments using SPHERE.
 
-### 1. Demilitarized Zone (DMZ)
-#### 1.1 Web Server Exploitation
-**Goal**: Simulate an external attacker gaining initial access through web vulnerabilities.
+### Deployed Scenarios
 
-1.1.A Vulnerable Struts2 Server:
--  CVE-2017-5638 (S2-045) ([deploy](struts2_lab/readme.md))
+| Lab | CVE | Service | Attack Type | Link |
+|-----|-----|---------|-------------|------|
+| Struts2 RCE | CVE-2017-5638 | Apache Struts 2.3.x | Remote code execution via crafted Content-Type header | [deploy](struts2_lab/readme.md) |
+| Heartbleed | CVE-2014-0160 | nginx 1.6.3 + OpenSSL 1.0.1f | TLS heartbeat memory leak (credentials, keys) | [deploy](heartbleed_lab/readme.md) |
+| Log4Shell | CVE-2021-44228 | Apache Solr 8.11.0 + Log4j 2.14.1 | JNDI injection → remote code execution | [deploy](log4shell_lab/readme.md) |
+| Redis Unauthorized Access | — | Redis 6.x (no auth) | Unauthenticated access → SSH key injection | [deploy](redis_unauth_lab/readme.md) |
+| SambaCry | CVE-2017-7494 | Samba 4.5.9 | Writable share → shared library upload → RCE | [deploy](sambacry_lab/readme.md) |
+
+### Planned Scenarios
+
+#### Web Server Exploitation
 -  wpDiscuz 7.0.0–7.0.4 (CVE-2020-24186)
--  Confleunce (CVE-2023-22527)
+-  Confluence (CVE-2023-22527)
 
-#### 1.2 FTP Server Exploitation
-**Objective**: Evaluate vulnerabilities and misconfigurations in file transfer services.
+#### FTP Server Exploitation
+- Anonymous FTP with Write Permission
+- vsftpd 2.3.4 Backdoor (CVE-2011-2523)
 
-1.2.A: Anonymous FTP with Write Permission
-
-1.2.B: vsftpd Backdoor
-- **Vulnerability**: CVE-2011-2523 (vsftpd 2.3.4 backdoor)
-- **Attack Path**:
-```
-FTP banner grabbing → Version identification → Backdoor trigger → Shell (port 6200)
-```
-
-#### Public-facing Workstation
-Email Phishing Attack
-
-#### Email Server
-
-#### DNS Server
+#### Other
+- Email Phishing Attack
+- DNS Server Exploitation
 
 ## Multi-Machine Scenarios
 Multi-Machine scenarios refer to attack simulation environments that involve more than two machines. Typically, there are multiple victim machines, which can be used to simulate attack scenarios that require lateral movement.

